@@ -1,9 +1,20 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <string.h>
+
+#if __has_include("secrets.h")
 #include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
 
 constexpr int REED_PIN = 23;
 constexpr int RELAY_PIN = 13;
+
+constexpr unsigned long WIFI_RETRY_MS = 10000;
+constexpr unsigned long MQTT_RETRY_MS = 5000;
+constexpr unsigned long RELAY_PULSE_MS = 300;
+constexpr unsigned long REED_DEBOUNCE_MS = 75;
 
 constexpr const char* TOPIC_STATE  = "garage/door/state";
 constexpr const char* TOPIC_STATUS = "garage/door/status";
@@ -14,23 +25,80 @@ constexpr const char* DISCOVERY_TOPIC =
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
-const char* currentDoorState = "UNKNOWN";
+enum class DoorState {
+  UNKNOWN,
+  OPEN,
+  CLOSED
+};
 
-void connectWiFi() {
-  Serial.println("WiFi Connecting...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+DoorState currentDoorState = DoorState::UNKNOWN;
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+bool relayPulseActive = false;
+unsigned long relayPulseStartMs = 0;
+unsigned long lastWiFiAttemptMs = 0;
+unsigned long lastMQTTAttemptMs = 0;
+
+int stableReedState = HIGH;
+int lastRawReedState = HIGH;
+unsigned long lastReedChangeMs = 0;
+bool wifiWasConnected = false;
+
+char mqttClientId[32] = {0};
+
+const char* doorStateToPayload(DoorState state) {
+  switch (state) {
+    case DoorState::OPEN:
+      return "OPEN";
+    case DoorState::CLOSED:
+      return "CLOSED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+DoorState doorStateFromReed(int reedValue) {
+  return (reedValue == HIGH) ? DoorState::OPEN : DoorState::CLOSED;
+}
+
+void setDoorStateFromSensor(int reedValue) {
+  DoorState nextState = doorStateFromReed(reedValue);
+  currentDoorState = nextState;
+}
+
+void buildClientId() {
+  unsigned long long mac = (unsigned long long)ESP.getEfuseMac();
+  snprintf(mqttClientId, sizeof(mqttClientId), "esp32-garage-%012llX", mac);
+}
+
+void triggerRelayPulse() {
+  if (relayPulseActive) {
+    Serial.println("Relay pulse ignored: already active");
+    return;
   }
 
-  Serial.println("\nWiFi Connected");
-  Serial.println(WiFi.localIP());
+  relayPulseActive = true;
+  relayPulseStartMs = millis();
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("Relay pulse started");
+}
+
+bool ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  unsigned long now = millis();
+  if (now - lastWiFiAttemptMs >= WIFI_RETRY_MS) {
+    lastWiFiAttemptMs = now;
+    Serial.println("WiFi reconnect attempt...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  return false;
 }
 
 void publishDiscovery() {
-  String payload = R"rawliteral(
+  static const char payload[] = R"rawliteral(
 {
   "name": "Garage Door",
   "unique_id": "esp32_garage_cover_01",
@@ -49,6 +117,7 @@ void publishDiscovery() {
   "optimistic": false,
 
   "availability_topic": "garage/door/status",
+  "availability_mode": "latest",
   "payload_available": "online",
   "payload_not_available": "offline",
 
@@ -61,90 +130,165 @@ void publishDiscovery() {
 }
 )rawliteral";
 
-  mqtt.publish(DISCOVERY_TOPIC, payload.c_str(), true);
+  bool ok = mqtt.publish(DISCOVERY_TOPIC, payload, true);
+  if (!ok) {
+    Serial.print("Discovery publish failed, mqtt rc=");
+    Serial.println(mqtt.state());
+  }
 }
+
 void publishDoorState() {
-  mqtt.publish(TOPIC_STATE, currentDoorState, true);
+  const char* payload = doorStateToPayload(currentDoorState);
+  bool ok = mqtt.publish(TOPIC_STATE, payload, true);
+  if (!ok) {
+    Serial.print("State publish failed, mqtt rc=");
+    Serial.println(mqtt.state());
+  }
 
   Serial.print("STATE: ");
-  Serial.println(currentDoorState);
+  Serial.println(payload);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
+  if (strcmp(topic, TOPIC_CMD) != 0) {
+    return;
   }
+
+  char cmd[16];
+  size_t copyLen = (length < sizeof(cmd) - 1) ? length : sizeof(cmd) - 1;
+  memcpy(cmd, payload, copyLen);
+  cmd[copyLen] = '\0';
 
   Serial.print("MQTT Command: ");
-  Serial.println(msg);
+  Serial.println(cmd);
 
-  if (msg == "OPEN" || msg == "CLOSE") {
-    Serial.println("Relay pulse triggered");
+  bool wantsOpen = strcmp(cmd, "OPEN") == 0;
+  bool wantsClose = strcmp(cmd, "CLOSE") == 0;
 
-    digitalWrite(RELAY_PIN, LOW);
-    delay(300);
-    digitalWrite(RELAY_PIN, HIGH);
+  if (!wantsOpen && !wantsClose) {
+    Serial.println("Ignored command: unsupported payload");
+    return;
   }
+
+  if ((wantsOpen && currentDoorState == DoorState::OPEN) ||
+      (wantsClose && currentDoorState == DoorState::CLOSED)) {
+    Serial.println("Ignored command: door already in requested state");
+    return;
+  }
+
+  triggerRelayPulse();
 }
-void connectMQTT() {
-  while (!mqtt.connected()) {
-    Serial.println("MQTT Connecting...");
 
-    if (mqtt.connect("esp32-garage")) {
-      Serial.println("MQTT Connected");
+void ensureMQTTConnected() {
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
 
-      mqtt.publish(TOPIC_STATUS, "online", true);
+  unsigned long now = millis();
+  if (now - lastMQTTAttemptMs < MQTT_RETRY_MS) {
+    return;
+  }
 
-      mqtt.subscribe(TOPIC_CMD);
+  lastMQTTAttemptMs = now;
+  Serial.println("MQTT connecting...");
 
-      publishDiscovery();
-      publishDoorState();
+  if (mqtt.connect(mqttClientId, TOPIC_STATUS, 1, true, "offline")) {
+    Serial.println("MQTT Connected");
 
-    } else {
-      Serial.print("MQTT Failed, rc=");
+    bool statusOk = mqtt.publish(TOPIC_STATUS, "online", true);
+    if (!statusOk) {
+      Serial.print("Status publish failed, mqtt rc=");
       Serial.println(mqtt.state());
-      delay(2000);
     }
+
+    bool subOk = mqtt.subscribe(TOPIC_CMD);
+    if (!subOk) {
+      Serial.print("Subscribe failed, mqtt rc=");
+      Serial.println(mqtt.state());
+    }
+
+    publishDiscovery();
+    publishDoorState();
+  } else {
+    Serial.print("MQTT Failed, rc=");
+    Serial.println(mqtt.state());
   }
 }
 
 void setup() {
   Serial.begin(9600);
+  WiFi.mode(WIFI_STA);
+  buildClientId();
 
   pinMode(REED_PIN, INPUT_PULLUP);
 
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
 
-  connectWiFi();
+  int initialReed = digitalRead(REED_PIN);
+  stableReedState = initialReed;
+  lastRawReedState = initialReed;
+  lastReedChangeMs = millis();
+  setDoorStateFromSensor(initialReed);
 
   mqtt.setBufferSize(1024);
   mqtt.setServer(MQTT_SERVER_IP, MQTT_SERVER_PORT);
   mqtt.setCallback(mqttCallback);
 
-  connectMQTT();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWiFiAttemptMs = millis();
+  lastMQTTAttemptMs = millis() - MQTT_RETRY_MS;
 
   Serial.println("Ready");
 }
+
 void loop() {
-  if (!mqtt.connected()) {
-    connectMQTT();
+  bool wifiConnected = ensureWiFiConnected();
+
+  if (wifiConnected && !wifiWasConnected) {
+    wifiWasConnected = true;
+    Serial.println("WiFi Connected");
+    Serial.println(WiFi.localIP());
+  } else if (!wifiConnected && wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WiFi disconnected");
+    if (mqtt.connected()) {
+      mqtt.disconnect();
+    }
   }
 
-  mqtt.loop();
+  if (wifiConnected) {
+    ensureMQTTConnected();
 
-  static int lastState = -1;
-  int state = digitalRead(REED_PIN);
-
-  if (state != lastState) {
-    lastState = state;
-
-    currentDoorState = (state == HIGH) ? "OPEN" : "CLOSED";
-
-    publishDoorState();
+    if (mqtt.connected()) {
+      mqtt.loop();
+    }
   }
 
-  delay(500);
+  unsigned long now = millis();
+
+  if (relayPulseActive && now - relayPulseStartMs >= RELAY_PULSE_MS) {
+    relayPulseActive = false;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("Relay pulse ended");
+  }
+
+  int rawState = digitalRead(REED_PIN);
+  if (rawState != lastRawReedState) {
+    lastRawReedState = rawState;
+    lastReedChangeMs = now;
+  }
+
+  if (rawState != stableReedState && now - lastReedChangeMs >= REED_DEBOUNCE_MS) {
+    stableReedState = rawState;
+
+    DoorState previous = currentDoorState;
+    setDoorStateFromSensor(stableReedState);
+
+    if (previous != currentDoorState && mqtt.connected()) {
+      publishDoorState();
+    }
+  }
+
+  delay(1);
 }
