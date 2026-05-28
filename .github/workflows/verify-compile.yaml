@@ -30,4 +30,4 @@ jobs:
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
             --warnings all \
-            esp32_door_sensor.ino
+            esp32_door_sensor
