@@ -1,7 +1,11 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <string.h>
+#if __has_include("secrets.h")
 #include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
 
 constexpr int REED_PIN = 23;
 constexpr int RELAY_PIN = 13;
@@ -61,8 +65,8 @@ void setDoorStateFromSensor(int reedValue) {
 }
 
 void buildClientId() {
-  uint32_t chipId = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
-  snprintf(mqttClientId, sizeof(mqttClientId), "esp32-garage-%06lX", (unsigned long)chipId);
+  unsigned long long mac = (unsigned long long)ESP.getEfuseMac();
+  snprintf(mqttClientId, sizeof(mqttClientId), "esp32-garage-%012llX", mac);
 }
 
 void triggerRelayPulse() {
@@ -232,6 +236,7 @@ void setup() {
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWiFiAttemptMs = millis();
+  lastMQTTAttemptMs = millis() - MQTT_RETRY_MS;
 
   Serial.println("Ready");
 }
@@ -284,4 +289,5 @@ void loop() {
     }
   }
 
+  delay(1);
 }
